@@ -4,6 +4,9 @@ const mysql = require('mysql2');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
+const nodemailer = require('nodemailer');
 
 const app = express();
 app.use(express.json());
@@ -17,37 +20,61 @@ const db = mysql.createPool({
     database: process.env.DB_NAME
 }).promise();
 
+const transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS
+    },
+    secure: true,
+});
+
+const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
+
 // Generate JWT Token
 const generateAccessToken = (user) => {
-    return jwt.sign(user, process.env.ACCESS_SECRET, { expiresIn: '2m' });
+    return jwt.sign({ id: user.id }, process.env.ACCESS_SECRET, { expiresIn: '2m' });
 };
-
 const generateRefreshToken = async (user) => {
     const refreshToken = jwt.sign(user, process.env.REFRESH_SECRET, { expiresIn: '4m' });
-    await db.execute("INSERT INTO refresh_tokens (user_id, token, expires_at) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 7 DAY))", [user.id, refreshToken]);
+    await db.execute("INSERT INTO refresh_tokens (token, user_id) VALUES (?, ?)", [refreshToken, user.id]);
     return refreshToken;
 };
 
-// Endpoint Registrasi
+// Middleware Authenticated Routes
+const authenticateToken = async (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) return res.sendStatus(401);
+
+    jwt.verify(token, process.env.ACCESS_SECRET, (err, user) => {
+        if (err) return res.sendStatus(403);
+        req.user = user;
+        next();
+    });
+};
+
+// Endpoint register
 app.post('/register', async (req, res) => {
-    const { username, password } = req.body;
+    const { email, password } = req.body;
 
     try {
-        const [existingUser] = await db.execute("SELECT * FROM users WHERE username = ?", [username]);
+        const [existingUser] = await db.execute("SELECT * FROM users WHERE email = ?", [email]);
         if (existingUser.length > 0) {
             return res.status(400).json({
                 status: "error",
-                message: "Username sudah digunakan",
+                message: "Email sudah digunakan",
                 data: null,
                 error: null
             });
         }
         const hashedPassword = await bcrypt.hash(password, 10);
-        await db.execute("INSERT INTO users (username, password) VALUES (?, ?)", [username, hashedPassword]);
+        await db.execute("INSERT INTO users (email, password) VALUES (?, ?)", [email, hashedPassword]);
         res.status(201).json({
             status: "success",
             message: "User berhasil didaftarkan",
-            data: { username },
+            data: { email },
             error: null
         });
     } catch (error) {
@@ -60,17 +87,17 @@ app.post('/register', async (req, res) => {
     }
 });
 
-// Endpoint Login
+// Endpoint login
 app.post('/login', async (req, res) => {
-    const { username, password } = req.body;
+    const { email, password } = req.body;
 
     try {
         // Cek apakah user ada di database
-        const [users] = await db.execute("SELECT * FROM users WHERE username = ?", [username]);
+        const [users] = await db.execute("SELECT * FROM users WHERE email = ?", [email]);
         if (users.length === 0) {
             return res.status(401).json({
                 status: "error",
-                message: "Username atau password salah",
+                message: "email atau password salah",
                 data: null,
                 error: null
             });
@@ -83,18 +110,15 @@ app.post('/login', async (req, res) => {
         if (!isValidPassword) {
             return res.status(401).json({
                 status: "error",
-                message: "Username atau password salah",
+                message: "email atau password salah",
                 data: null,
                 error: null
             });
         }
 
-        // Generate token
-        const accessToken = jwt.sign({ id: user.id }, process.env.ACCESS_SECRET, { expiresIn: '15m' });
-        const refreshToken = jwt.sign({ id: user.id }, process.env.REFRESH_SECRET, { expiresIn: '7d' });
-
-        // Simpan refresh token ke database
-        await db.execute("INSERT INTO refresh_tokens (token, user_id) VALUES (?, ?)", [refreshToken, user.id]);
+        const accessToken = await generateAccessToken(user);
+        const refreshToken = await generateRefreshToken(user);
+        
 
         res.status(200).json({
             status: "success",
@@ -113,6 +137,79 @@ app.post('/login', async (req, res) => {
     }
 });
 
+// Endpoint forgot password
+app.post('/auth/forgot_password', async (req, res) => {
+    const { email } = req.body;
+    const [users] = await db.execute("SELECT * FROM users WHERE email = ?", [email]);
+    if (users.length === 0) {
+        return res.status(404).json({
+            status: "error",
+            message: "Email tidak ditemukan",
+            data: null,
+            error: null
+        });
+    }
+    const otp = generateOTP();
+    await db.execute("INSERT INTO password_reset (email, otp, expires_at) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 10 MINUTE))", [email, otp]);
+    let otphtml = fs.readFileSync(path.join(__dirname, 'otp.html'), 'utf8');
+    otphtml = otphtml.replace('{{email}}', email).replace('{{otp}}', otp);
+    await transporter.sendMail({
+        from: process.env.EMAIL_USER,
+        to: email,
+        subject: "Reset Password OTP",
+        html: otphtml
+    }, (error, info) => {
+        if (error) {
+            res.status(500).json({
+                status: "error",
+                message: "Terjadi kesalahan saat mengirim OTP",
+                data: null,
+                error: error
+            });
+        } else {
+            res.status(200).json({
+                status: "success",
+                message: "OTP telah dikirim ke email Anda",
+                data: null,
+                error: null
+            });
+        }
+    });
+});
+
+// Endpoint reset password
+app.post('/auth/reset_password', async (req, res) => {
+    const { email, otp, newPassword } = req.body;
+    try {
+        const [rows] = await db.execute("SELECT * FROM password_reset WHERE email = ? AND otp = ? AND expires_at > NOW()", [email, otp]);
+        if (rows.length === 0) {
+            return res.status(400).json({
+                status: "error",
+                message: "OTP tidak valid atau telah kadaluarsa",
+                data: null,
+                error: null
+            });
+        }
+        const hashedPassword = await bcrypt.hash(newPassword, 10);
+        await db.execute("UPDATE users SET password = ? WHERE email = ?", [hashedPassword, email]);
+        await db.execute("DELETE FROM password_reset WHERE email = ?", [email]);
+
+        res.status(200).json({
+            status: "success",
+            message: "Password berhasil diperbarui",
+            data: null,
+            error: null
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: "Terjadi kesalahan saat mereset password",
+            data: null,
+            error: error.message
+        });
+    }
+});
+
 
 // Endpoint Refresh Token
 app.post('/refresh', async (req, res) => {
@@ -121,7 +218,7 @@ app.post('/refresh', async (req, res) => {
     if (!refreshToken) {
         return res.status(401).json({
             status: "error",
-            message: "Refresh token tidak diberikan",
+            message: "Refresh token undefined",
             data: null,
             error: null
         });
@@ -149,7 +246,7 @@ app.post('/refresh', async (req, res) => {
                 });
             }
 
-            const newAccessToken = jwt.sign({ id: user.id }, process.env.ACCESS_SECRET, { expiresIn: '15m' });
+            const newAccessToken = generateAccessToken(user)
 
             res.status(200).json({
                 status: "success",
@@ -169,12 +266,11 @@ app.post('/refresh', async (req, res) => {
     }
 });
 
-
 // Endpoint Logout
 app.post('/logout', async (req, res) => {
-    const { accessToken, refreshToken } = req.body;
+    const { refreshToken } = req.body;
 
-    if (!accessToken ||!refreshToken) {
+    if (!refreshToken) {
         return res.status(400).json({
             status: "error",
             message: "Access token atau refresh token tidak diberikan",
@@ -185,13 +281,6 @@ app.post('/logout', async (req, res) => {
 
     try {
         await db.execute("DELETE FROM refresh_tokens WHERE token = ?", [refreshToken]);
-
-        jwt.verify(accessToken, process.env.ACCESS_SECRET, (err, decoded) => {
-            if (!err) {
-                const expiresAt = new Date(decoded.exp * 1000); // Convert ke datetime
-                db.execute("INSERT INTO token_blacklist (token, expires_at) VALUES (?, ?)", [accessToken, expiresAt]);
-            }
-        });
 
         res.status(200).json({
             status: "success",
@@ -210,26 +299,6 @@ app.post('/logout', async (req, res) => {
     }
 });
 
-
-// Middleware Authenticated Routes
-const authenticateToken = async (req, res, next) => {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-
-    if (!token) return res.sendStatus(401);
-
-    // Periksa apakah token ada di blocklist
-    const [rows] = await db.execute("SELECT * FROM token_blacklist WHERE token = ?", [token]);
-    if (rows.length > 0) return res.sendStatus(403); // Token telah di-blacklist
-
-    jwt.verify(token, process.env.ACCESS_SECRET, (err, user) => {
-        if (err) return res.sendStatus(403);
-        req.user = user;
-        next();
-    });
-};
-;
-
 // Contoh Route yang Butuh Autentikasi
 app.get('/protected', authenticateToken, (req, res) => {
     res.status(200).json({
@@ -239,7 +308,6 @@ app.get('/protected', authenticateToken, (req, res) => {
         error: null
     });
 });
-
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
